@@ -1,0 +1,828 @@
+Code and Protocols
+
+Zea mays RNA-seq estimated transcript abundances are strongly affected by read mapping bias
+
+Shuhua Zhan
+March 23, 2021
+
+
+1. Sequence filtering and quality control. All fastq sequences from parental and RIL lines were processed in a QC step.
+ 
+FastQC and fastx_trimmer are used for quality control and trimming. 
+$ for i in *.fastq; do sqsub -q serial -r 4h --mpp=8G -o $i.out fastqc $i; done
+
+
+Reads in 107 .fastq files are  trimmed at low quality 3' sequences using fastx_trimmer (http://hannonlab.cshl.edu/fastx_toolkit/ ).
+$ for i in *.fastq; do sqsub -q serial -r 8h --mpp=8G -o $i.out fastx_trimmer -f 1 -l 75 -i $i -o /scratch/zshuhua/SRR055066faq75/$i; done
+
+
+
+2. Fastq sequences across all samples were aligned to B73 and Mo17 reference genomes. These alignments were used for gene expression estimation and SNP calling.
+
+Tophat:
+$ for i in *.fastq; do sqsub -q serial -r 8h --mpp=16G -o $i.Tophat.out tophat $i.THout -i 5 -I 60000 -p 8 --seqment-length 25 -m 1 -G /work/zshuhua/Zea_mays.AGPv3.19.gtf --transcriptome-index=transcriptome-data/B73_v3_FGS -T -M -x 1 /work/zshuhua/RefGenV3 $i; done
+
+Star:
+The command to index the genome:
+$ sqsub --mpp=40G -r 8h -q cgriswol -f threaded -n 8 -o genomeIndex.out STAR --runThreadN 8 --runMode genomeGenerate --genomeDir /work/zshuhua/Postdoc/maizeAGPv3 --genomeFastaFiles /work/zshuhua/Postdoc/RefGenV3.fa --sjdbGTFfile /work/zshuhua/Postdoc/Zea_mays.AGPv3.19.gtf --sjdbOverhang 74
+
+The command to align reads to the genome: 
+$ for i in /work/zshuhua/SRA055066faq75/*.fastq; do sqsub --mpp=40G -r 8h -q cgriswol -f threaded -n 4 -o /work/zshuhua/Postdoc/IBMSTAR107/${i##*/}.out STAR --runThreadN 4 --runMode alignReads --genomeLoad NoSharedMemory --genomeDir /work/zshuhua/Postdoc/maizeAGPv3 --readFilesIn $i  --outFilterMultimapNmax 20 --outFilterMismatchNoverReadLmax 0.04 --outFilterMismatchNmax 3 --seedSearchStartLmax 25 --alignIntronMin 5 --alignIntronMax 60000 --outFileNamePrefix /work/zshuhua/Postdoc/IBMSTAR107/${i##*/}. --outSAMtype BAM SortedByCoordinate --outSAMstrandField intronMotif --quantMode TranscriptomeSAM GeneCounts --twopassMode Basic --twopass1readsN -1 --sjdbOverhang 74; done
+
+
+
+3. Post-alignment processing
+
+Duplicate reads were removed by Samtools rmdup.
+$ for i in *.bam; do sqsub --mpp=16G -r 8h -q cgriswol -f serial -o $i.dedup.out samtools rmdup -s $i dedup.$i; done
+
+
+
+4. SNP detection and SNP calling protocol between B73 and Mo17
+
+Identifying SNPs between B73 and Mo17 to identify SNPs to use later for genotyping the recombinant inbred lines.
+
+4.1 Samtools and BCFtools used trimmed reads mapped to B73 genome with Tophat to call SNPs between B73 and Mo17.
+
+###
+#!/bin/bash
+
+for i in /scratch/zshuhua/SRA055066faq75/TophatAcHits/DedupBAM/*.bam;
+
+do
+
+samtools mpileup -uD -f /work/zshuhua/Postdoc/RefGenV3.fa $i | bcftools view -cg - > $i.raw.vcf
+
+done
+###
+
+4.2 Three Perl scripts (extractSNPs.pl, filterSNPs.pl and refineSNPs20.pl) were used to identify SNPs between two parents based on their called variants in the vcf files.
+
+###
+extractSNPs.pl
+
+!/usr/bin/perl
+
+use strict;
+use warnings;
+
+#This script will go through the vcf
+#of B73 and Mo17 inbred reads aligned to B73 reference and 
+#find SNPs between the two inbreds
+
+my $usage = "perl extractSNPs.pl B73 Mo17 outfile outfile1 outfile2 outfile3\n";
+my $B73 = shift || die $usage; 
+my $Mo17 = shift || die $usage; 
+my $outfile = shift || die $usage; 
+my $outfile1 = shift || die $usage; 
+my $outfile2 = shift || die $usage; 
+my $outfile3 = shift || die $usage; 
+my %B73_SNPs;
+
+open IN, "$B73" || die "could not open $B73 for reading:$!\n";
+
+while (<IN>) {
+
+	s/\cM//;
+	chomp;
+	next if (m/^#/);
+	my ($chrom, $pos, $id, $ref, $alt, $qual, $filter, $info, $format, $geno) = split /\t/;
+
+	next if ($info=~m/INDEL/);
+	my $DP4 = $_;
+
+	if ($alt =~ /[ATGC]/) {
+
+                $DP4 =~ s/.*DP4=([0-9,]*).*/$1/;
+                my ($BF,$BR,$MF,$MR) = split /,/, $DP4;
+		
+		# add to hash if BF+BR =0 
+		if ($BF+$BR == 0 && $MF+$MR>= 5) {    
+		      $B73_SNPs{$chrom}{$pos} = $alt;
+        	}
+	}
+}
+
+close IN;
+
+open OUT, ">$outfile" || die $usage;
+open OUT1, ">$outfile1" || die $usage;
+open OUT2, ">$outfile2" || die $usage;
+open OUT3, ">$outfile3" || die $usage;
+print OUT "Chromosome\tPosition\tMo17_allel\tB73_allel\n";
+print OUT1 "Chromosome\tPosition\tRef_allel\tB73_allel\n";
+print OUT2 "Chromosome\tPosition\tMo17_allel\tRef_allel\n";
+print OUT3 "Chromosome\tPosition\tMo17_allel\tB73_allel\n";
+
+
+my %Mo17_SNPs;
+
+open IN, "$Mo17" || die "could not open $Mo17 for reading: $!\n";
+
+while (<IN>) {
+
+	s/\cM//;
+	chomp;
+	next if (m/^#/);
+	my ($chrom, $pos, $id, $ref, $alt, $qual, $filter, $info, $format, $geno) = split /\t/;
+	next if ($info=~m/INDEL/);
+	my $DP4 = $_;
+
+	if ($alt =~ /[ATGC]/) {
+
+                $DP4 =~ s/.*DP4=([0-9,]*).*/$1/;
+                my ($BF,$BR,$MF,$MR) = split /,/, $DP4;
+		# add to hash if BF+BR =0 
+
+		if ($BF+$BR == 0 && $MF+$MR>= 5) {   
+
+		        unless ($B73_SNPs{$chrom}{$pos}) {
+			       $Mo17_SNPs{$chrom}{$pos}{$alt}=$ref;
+						print OUT2 "$chrom\t$pos\t$alt\t$ref\n";
+		       }
+                       else{
+                              if($alt !~ $B73_SNPs{$chrom}{$pos}){
+
+                                     $Mo17_SNPs{$chrom}{$pos}{$alt}=$B73_SNPs{$chrom}{$pos};
+                                     print OUT3 "$chrom\t$pos\t$alt\t$B73_SNPs{$chrom}{$pos}\n";
+                              }
+                       }
+		}
+	}
+
+        else{
+                $DP4 =~ s/.*DP=([0-9]*).*/$1/;
+
+                if($DP4 >=5) {
+                        #store B73 SNPs info in the hash
+
+                        if($B73_SNPs{$chrom}{$pos}){
+
+                                $Mo17_SNPs{$chrom}{$pos}{$ref}=$B73_SNPs{$chrom}{$pos};
+                              print OUT1 "$chrom\t$pos\t$ref\t$B73_SNPs{$chrom}{$pos}\n";
+                        }
+                }                        
+        }
+}
+close IN;
+
+foreach my $chrom ( keys %Mo17_SNPs) {
+
+	foreach my $pos ( keys %{ $Mo17_SNPs{$chrom} } ) {    
+
+		foreach my $alt ( keys %{ $Mo17_SNPs{$chrom}{$pos}}){
+		        print OUT "$chrom\t$pos\t$alt\t$Mo17_SNPs{$chrom}{$pos}{$alt}\n";
+                }
+	}
+}
+
+close OUT;
+###
+
+###
+filterSNPs.pl
+
+#!/usr/bin/perl
+
+use strict;
+
+use warnings;
+
+#This script will filter out SNPs in those positions either
+
+##B73 or Mo17 has two or more alternative alleles
+my $usage = "perl filterSNPs.pl SNPsM SNPsS\n";
+my $SNPsM = shift || die $usage; # SNPs before filtering
+my $SNPsS = shift || die $usage; # SNPs after filtering
+my %S_SNPs;
+
+open IN, "$SNPsM" || die "could not open $SNPsM for reading:$!\n";
+
+while (<IN>) {
+
+	chomp;
+	next if (m/^s/);
+	my ($chrom, $pos, $Mo17, $B73) = split /\t/;
+
+	if (length($B73)==1 && length($Mo17)==1) {
+              $S_SNPs{$chrom}{$pos}{$Mo17} = $B73;
+	}
+}
+
+close IN;
+
+open OUT, ">$SNPsS" || die $usage;
+
+print OUT "Chromosome\tPosition\tMo17_allel\tB73_allel\n";
+
+foreach my $chrom (sort {$a<=>$b} keys %S_SNPs) {
+	foreach my $pos (sort {$a<=>$b} keys %{ $S_SNPs{$chrom} } ) {
+		foreach my $alt (sort keys %{ $S_SNPs{$chrom}{$pos}}){
+		        print OUT "$chrom\t$pos\t$alt\t$S_SNPs{$chrom}{$pos}{$alt}\n";
+                }
+	}
+}
+
+close OUT;
+###
+
+At every SNP position, to call a SNP, both B73 and Mo17 nucleotide positions had to have >= 5 aligned reads. The vcf quality score had to be >=20.
+
+###
+refineSNPs20.pl
+
+!/usr/bin/perl
+use strict;
+use warnings;
+#This script will retrieve SNPs which have quality scores >=20
+#in both Mo17 and B73
+my $usage = "perl refineSNPs20.pl SNPsM20 SNPsB20 SNPs20 \n";
+my $SNPsM = shift || die $usage; # SNPs with quality score >=20 in Mo17 
+my $SNPsB = shift || die $usage; # SNPs with quality score >=20 in B73
+my $SNPs = shift || die $usage;  # SNPs with quality score>=20 in both alleles
+my %M_SNPs;
+
+open IN, "$SNPsM" || die "could not open $SNPsM for reading:$!\n";
+
+while (<IN>) {
+	chomp;
+	next if (m/^C/);
+	my ($chrom, $pos, $Mo17, $B73) = split /\t/;
+        my @allels= ($Mo17,$B73);
+        $M_SNPs{$chrom}{$pos} = [ @allels ];
+
+}
+
+close IN;
+open OUT, ">$SNPs" || die $usage;
+print OUT "Chromosome\tPosition\tMo17_allel\tB73_allel\n";
+my %B_SNPs;
+open IN, "$SNPsB" || die "could not open $SNPsB for reading: $!\n";
+
+while (<IN>) {
+
+	chomp;
+	next if (m/^C/);
+
+	my ($chrom, $pos, $Mo17, $B73) = split /\t/;
+        my @allels= ($Mo17,$B73);
+        $B_SNPs{$chrom}{$pos} = [ @allels ];
+
+}
+
+close IN;
+
+foreach my $chrom ( keys %M_SNPs) {
+
+	foreach my $pos ( keys %{ $M_SNPs{$chrom} } ) {
+
+                if($B_SNPs{$chrom}{$pos}){   
+		      print OUT "$chrom\t$pos\t", join("\t", @{ $M_SNPs{$chrom}{$pos}}), "\n";
+                }
+	}
+}
+close OUT;
+###
+
+
+
+5. Gene expression estimation
+
+To estimate gene expression levels across lines, we used the .bam files generated above by STAR and TopHat. We also made new estimates with Salmon.
+
+
+5.1 Cufflinks-2.1.1 was used to process TopHat output. StringTie-1.3.3b was used to process STAR output. 
+
+Cufflinks code:
+
+$ for i in dedup*bam; do sqsub --mpp=4G -r 8h -q threaded -n 8 -o $.Cuff.out culfflinks -o $i.cuff -p 8  -G /work/zshuhua/Postdoc/Zea_mays.AGPv3.19.gtf -b /work/zshuhua/Postdoc/RefGenV3.fa -u --compatible-hits-norm $i; done
+
+StringTie code:
+
+$ for i in dedup*.bam; do sqsub --mpp=32G -r 8h -q cgriswol -f threaded -n 4 -o $i.ST.out stringtie $i -o $i.gtf -p 4 -G /work/zshuhua/Postdoc/Zea_mays.AGPv3.19.gtf -A $i.gene_abund.tab -C $i.cov_refs.gtf -e; done
+
+
+5.2 Salmon-1.3.0 mapping-based mode also estimated transcript abundances across all samples. 
+
+Scripts:
+(1)sallmonindex.sh indexes a decoy-aware transcriptome of AGPv3.19
+(2)salmonquant.sh quantifies transcript abundances.
+(3)quantcoverttximport.R quantifies transcript abundances as gene-level abundances by Tximport-1.18.0 using a R script.
+
+
+###(1)
+sallmonindex.sh
+
+#!/bin/bash
+
+#SBATCH --time=0-12
+#SBATCH --account=def-lukens
+#SBATCH --mem=65536M
+#SBATCH --job-name=salmonindex
+#SBATCH --output=%x-%j.out
+#SBATCH --cpus-per-task=12
+
+
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+
+module load  nixpkgs/16.09  gcc/7.3.0  openmpi/3.1.4 salmon/1.3.0
+
+salmon index -t gentrome.fa.gz -d decoys.txt -p $SLURM_CPUS_PER_TASK -i salmon_index
+###
+
+###(2)
+salmonquant.sh
+
+#!/bin/bash
+
+#SBATCH --time=1-12
+#SBATCH --account=def-lukens
+#SBATCH --mem=65536M
+#SBATCH --job-name=salmonquant
+#SBATCH --output=%x-%j.out
+#SBATCH --cpus-per-task=24
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+module load  nixpkgs/16.09  gcc/7.3.0  openmpi/3.1.4 salmon/1.3.0
+
+for fn in /home/zshuhua/projects/def-lukens/zshuhua/SharcnetArchiveZhan/SRA055066faq75/*.fastq
+do
+        samp=$( echo ${fn} |sed "s/\/home\/zshuhua\/projects\/def-lukens\/zshuhua\/SharcnetArchiveZhan\/SRA055066faq75\///" |sed "s/\.fastq//")
+
+        echo "Processing sample ${samp}"
+
+        salmon quant -i salmon_index -l A -r ${fn} \
+
+                -p $SLURM_CPUS_PER_TASK  -g Zea_mays.AGPv3.19.gtf.gz \
+                --validateMappings \
+                -o quants/${samp} \
+                --gcBias --seqBias --posBias
+
+done
+###
+
+
+###(3) quantcoverttximport.R
+
+## This R script uses ensembldb and tximport R packages to summarize transcript abundances by Salmon to gene abundances.
+
+
+library(ensembldb)
+
+## Create a EnsDb database file from GtF
+
+gtfFile <- file.path("/home/zshuhua/projects/def-lukens/zshuhua/TPMsSalmon/Zea_mays.AGPv3.19.gtf.gz")
+
+dbFile <- ensDbFromGtf(gtf=gtfFile, organism="Zea_mays", genomeVersion="AGPv3", version=19)
+
+edb <- EnsDb(dbFile)
+
+
+## Retrieve all keys corresponding to transcript ids.
+
+txids <- keys(edb, keytype = "TXID")
+
+length(txids)
+
+tx2gene  <- select(edb, keys = txids, keytype = "TXID", columns = "GENEID")
+
+
+library(tximport)
+
+
+dir <- "/home/zshuhua/projects/def-lukens/zshuhua/TPMsSalmon"
+
+samples <- read.table(file.path(dir, "samples.txt"), header = TRUE) ## 107 samples 
+
+files <- file.path(dir, "quants", samples$sample, "quant.sf")
+
+names(files) <- samples$sample
+
+all(file.exists(files))
+
+txi <- tximport(files, type = "salmon", tx2gene = tx2gene)
+
+names(txi)
+
+write.table( as.data.frame(txi$abundance), file.path(dir, "quants", "genesabundance.txt"), sep="\t", col.names=NA, quote=F)
+
+write.table( as.data.frame(txi$counts), file.path(dir, "quants", "genescounts.txt"), sep="\t", col.names=NA, quote=F)
+###
+
+
+
+6. Generate expression matrices (gene x genotype) were created for each set of gene expression estimates across the 97 RILs.
+
+As an example, a perl script get97RILsChrGenesTPMs.R generated this matrix using Salmon mapping-based mode quantification.
+
+###
+get97RILsChrGenesTPMs.R
+
+Dt107<-read.delim("/home/zshuhua/projects/def-lukens/zshuhua/TPMsSalmon/quants/genesabundance.txt", header=T)
+
+Ril97<-read.delim("/home/zshuhua/projects/def-lukens/zshuhua/TPMsStringTie/geneMatrix97.txt", header=T)
+
+colnames(Dt107)[1]<-colnames(Ril97)[1]
+
+Dt97<-Dt107[,colnames(Ril97)]
+
+Rilchr97<-read.delim("/home/zshuhua/projects/def-lukens/zshuhua/TPMsStringTie/ZM.AGPv3.19.chrgenes.txt", header=T)
+
+Dt97chr<-Dt97[Dt97$gene_id %in% Rilchr97$Gene,]
+
+write.table(Dt97chr, file="/home/zshuhua/projects/def-lukens/zshuhua/TPMsSalmon/genesTPMsSALevel97.txt", sep="\t",row.names=F, quote=F)
+###
+
+
+
+7. Constructing a gene expression matrix to be used in eQTL mapping
+
+Variable genes in each expression matrix were used to map eQTL.
+
+Genes expressed at > 1 FPKM (Cufflinks/Stringtie) or >1.82 TPM (Salmon/Stringtie) in at least 42 RILs (43%) were selected. Subsequently the 75% most variable genes among the RILs were selected.
+
+Code examples used to process Salmon output:
+
+1) get97RILsSALevelChrs40.pl filtered genes expressed at >1.82 TPM in at least 42 RILs
+2) getVaryChrGenes40SA.R selected 19,873 variable genes.
+
+
+###(1)
+get97RILsSALevelChrs40.pl 
+
+#!/usr/local/bin/perl5 -w
+# This program extracts non-MiR genes which expressed in at least 40% of IBM RILs
+# forms the gene expression matrix across 97 inbred lines at different cut-off expression TPMs.
+
+use strict;
+my $start_run = time();
+open (FILEHANDLE, "/home/zshuhua/projects/def-lukens/zshuhua/TPMsSalmon/genesTPMsSALevel97.txt")
+   or die ("Can not open genesTPMsSALevel97.txt");
+
+my $head=<FILEHANDLE>;
+my %hash1=();
+
+while (<FILEHANDLE>){
+
+	chomp;
+        unless (/^z/){
+            my $act=0;
+            my @arr1=split /\t/;
+            for(my $i=1; $i<=$#arr1; $i++){
+                if($arr1[$i]>1.82){
+                    $act++;
+                }
+            }
+            if(($act/$#arr1)>=0.4){
+                @{$hash1{$arr1[0]}}=@arr1[0..$#arr1];
+            }
+        }
+}
+
+close (FILEHANDLE);
+
+open (OUT, ">/home/zshuhua/projects/def-lukens/zshuhua/TPMsSalmon/NonMirTPMs97RILsSALevelChr40q.txt") || die "Can't open file: $!";
+
+
+# print header for expression matrix
+print OUT $head;
+# output the result in the hash
+my $num=0;
+
+for my $key ( sort {$b cmp $a} (keys %hash1)){
+
+    print  OUT  join("\t",@{$hash1{$key}}), "\n";
+    $num++;
+}
+
+close (OUT) || die "Can't close new file: $!";
+
+print "Genes:", $num, "\n";
+###
+
+
+###(2)
+getVaryChrGenes40SA.R
+
+data1<-read.delim("/home/zshuhua/projects/def-lukens/zshuhua/TPMsSalmon/NonMirTPMs97RILsSALevelChr40q.txt", header=T)
+
+mat1<-as.matrix(data1[,-1])
+
+expvar1<-apply(mat1, 1, var)
+
+data2<-cbind(data1,expvar1)
+
+dt1qu<-data2[expvar1>summary(expvar1)[2],]
+
+dt1qu1<-dt1qu[,-99]
+
+write.table(dt1qu1, file="/home/zshuhua/projects/def-lukens/zshuhua/TPMsSalmon/NonMirTPMs97RILsSALevelChr40qVar1qu.txt", quote=F, sep="\t", row.names=F)
+###
+
+
+
+8. SNP calls across all lines were collected into one file.
+
+Genotyping the IBM population. Perl script (genotypeRILHetFra.pl) was used to genotype the population using the identified SNPs based on the call variants.
+
+###
+genotypeRILHetFra.pl
+
+!/usr/bin/perl
+use strict;
+use warnings;
+
+#This script genotypes the RILs using the SNPs between the two parental inbreds
+my %BM_SNPs;
+
+open IN, "/work/zshuhua/Postdoc/SNPcallMaizeIBM/SNPcalling/SNPB73Mo17/SNPsMB20.txt" || die "could not open fileSNPsMB20.txt for reading:$!\n";
+
+while (<IN>) {
+	chomp;
+	next if (m/^C/);
+	my ($chrom, $pos, $Mo17, $B73) = split /\t/;
+        my @allels= ($Mo17,$B73);
+        $BM_SNPs{$chrom}{$pos} = [ @allels ];
+}
+
+close IN;
+
+
+my %Geno;
+
+open OUT, ">RILgenotypesHetFra.txt" || die "Can't open output file RILgenotypesHetFra.txt:$!\n";
+
+print OUT "Chromosome\tPosition\t";
+
+while(defined(my $filename=glob("*.vcf"))){
+
+        open(IN, "$filename") || die "can not open $filename:$!\n";
+        $filename=~ s/\.raw\.vcf//;
+        #print OUT $filename, "\t";
+
+    while (<IN>) {
+
+	s/\cM//;
+	chomp;
+	next if (m/^#/);
+	next if (m/^s/);
+	my ($chrom, $pos, $id, $ref, $alt, $qual, $filter, $info, $format, $geno) = split /\t/;
+	next if ($info=~m/INDEL/);
+	my $DP4 = $_;
+
+	if ($alt =~ /[ATGC]/) {
+                $DP4 =~ s/.*DP4=([0-9,]*).*/$1/;
+                my ($BF,$BR,$MF,$MR) = split /,/, $DP4;
+
+		if ($BM_SNPs{$chrom}{$pos}) {
+
+		        if ($BF+$BR >= 5 && $MF+$MR>= 5 && ($BF+$BR)/($BF+$BR+$MF+$MR)>= 0.25 &&($MF+$MR)/($BF+$BR+$MF+$MR)>= 0.25 && $qual>=20) {   
+
+                             $Geno{$filename}{$chrom}{$pos}="H";
+
+		       }
+		        elsif ($BF+$BR >= 5 && $MF+$MR<=3 && ($BF+$BR)/($BF+$BR+$MF+$MR)>=0.8 && $qual>=20) {   
+                               if ($alt eq $BM_SNPs{$chrom}{$pos}[0]){
+                                     $Geno{$filename}{$chrom}{$pos}="B";
+                               }
+
+                               if ($alt eq $BM_SNPs{$chrom}{$pos}[1]){
+                                     $Geno{$filename}{$chrom}{$pos}="A";
+                               }
+		       }
+
+		        elsif ( $BF+$BR <=3 && $MF+$MR>= 5 && ($MF+$MR)/($MF+$MR+$BF+$BR)>=0.8 && $qual>=20) {   
+                               if ($alt eq $BM_SNPs{$chrom}{$pos}[0]){
+                                     $Geno{$filename}{$chrom}{$pos}="A";
+                               }
+
+                               if ($alt eq $BM_SNPs{$chrom}{$pos}[1]){
+                                     $Geno{$filename}{$chrom}{$pos}="B";
+                               }
+		       }
+
+                       else{
+                             $Geno{$filename}{$chrom}{$pos}="N";
+                       }
+		}
+	}
+        else{
+                $DP4 =~ s/.*DP=([0-9]*).*/$1/;
+
+                if($BM_SNPs{$chrom}{$pos}){
+
+                        if($DP4 >=5 && $qual>=20) {
+
+                               if ($ref eq $BM_SNPs{$chrom}{$pos}[0]){
+                                     $Geno{$filename}{$chrom}{$pos}="A";
+
+                               }
+                               if ($ref eq $BM_SNPs{$chrom}{$pos}[1]){
+                                     $Geno{$filename}{$chrom}{$pos}="B";
+                               }
+                        }
+                        else{
+                                     $Geno{$filename}{$chrom}{$pos}="N";
+                        }
+                }                        
+        }
+    }
+close IN;
+}
+
+foreach my $filename ( sort keys %Geno){
+	print OUT $filename, "\t";
+}
+
+print OUT "\n";
+
+foreach my $chrom ( keys %BM_SNPs) {
+	foreach my $pos ( keys %{ $BM_SNPs{$chrom} } ) {
+            foreach my $filename ( sort keys %Geno){
+                if($filename eq "B73_SNP_dedup_out"){
+                    if($Geno{$filename}{$chrom}{$pos}){
+
+		      print OUT "$chrom\t$pos\t$Geno{$filename}{$chrom}{$pos}\t";
+                    }
+                    else{
+                      print OUT "$chrom\t$pos\tN\t";
+                    }
+                }
+                else{
+                    if($Geno{$filename}{$chrom}{$pos}){
+		      print OUT "$Geno{$filename}{$chrom}{$pos}\t";
+                    }
+                    else{
+                      print OUT "N\t";
+                    }
+                }
+            }
+              print OUT "\n";
+	}
+}
+
+close OUT;
+###
+
+
+
+9. Genetic map construction.
+
+To construct the genetic map, informative SNP markers which have a minor allele frequency > 30% and a missing data rate < 5% were included. MadMapper (https://github.com/alex-kozik/atgc-map) generated non-redundant marker scores and grouped markers. MSTmap ordered markers and built the linkage maps.
+ 
+The two commands below generated non-redundant marker scores and grouped markers.
+$ python Python_MadMapper_V254_RECBIT_V131010.py RIL97_data.markers.loc RIL97.markers.recbit01 0.2 100 25 x 0.33 50 NR_SET 3
+
+$ python Python_MadMapper_V254_RECBIT_V131010.py RIL97.markers.recbit01.z_nr_scores.loc RIL97_scores.recbit02 0.2 100 80 x 0.33 20 NOTRIO 3
+
+
+MSTmap was used to build linkage maps LG1 to LG10.
+The command for LG1:
+
+$ ./MSTMap.exe LG1.MST.txt LG1_map.txt
+
+
+
+10. eQTL mapping
+
+eQTL were mapped using non-parametric interval mapping in R/qtl. 1000 permutations were used to define a genome-wide LOD significance threshold for an eQTL at a=0.05.
+
+The average gene expression of lines carrying the B73 and Mo17 alleles at an eQTL were estimated using the effectplot function in R/qtl.
+
+As an example, for the selected 19,873 variable genes from Salmon mapping-based mode quantification,
+(1) geteqtlflpschrs.R mapped QTL
+(2) geteqtleffsSA.R estimated their effects 
+
+
+###(1)
+#geteqtlflpschrs.R
+library(qtl)
+
+setwd("/home/zshuhua/projects/def-lukens/zshuhua/TPMsSalmon/QTLmappingSA/")
+
+ibm<-read.cross("csvs", ".", "IBM97_2236_genos.csv", "RILsLevelChr40qVar1qu97T_phes.csv",genotypes=c("A","H","B"), alleles=c("A","B"))
+
+ibm<-flip.order(ibm, c(2,4,7,10))
+
+ibmr<-convert2riself(ibm)
+
+ibmr <- calc.genoprob(ibmr, step=1, error.prob=0.001)
+
+out1.np <- scanone(ibmr, pheno.col=1:19873,model="np")
+
+operm1.np <- scanone(ibmr, pheno.col=1:19873,model="np", n.perm=1000)
+
+oper<-summary(operm1.np, alpha=c(0.05,0.01))
+
+write.table(oper, file="LODs_flp_T19873.txt",sep="\t",col.names=NA, quote=F)
+
+op<-summary(out1.np,format="tabByCol",perms=operm1.np, alpha=0.05, pvalues=TRUE)
+
+result <- lapply(names(op), function(x){
+
+if(dim(op[[x]])[1]>0){
+
+  col1 <- x
+  col2 <- row.names(op[[x]])
+  mat <- op[[x]]
+  row.names(mat) <- NULL
+  rval <- cbind(col1, col2, mat)
+  names(rval) <- c("trait", "locus", names(mat))
+  rval
+
+}})
+
+sss<-do.call(rbind, result)
+
+write.table(sss, file="qtls_flp_T19873.txt",sep="\t",col.names=NA, quote=F)
+###
+
+
+###(2)
+#geteqtleffsSA.R
+
+library(qtl)
+
+setwd("/home/zshuhua/projects/def-lukens/zshuhua/TPMsSalmon/QTLmappingSA/")
+
+dat<-read.delim("/home/zshuhua/projects/def-lukens/zshuhua/TPMsSalmon/QTLmappingSA/all_qtls_genes_flp_T19873.txt")
+
+loc<-as.vector(dat$locus)
+
+trt<-as.vector(dat$trait)
+
+locs<-c()
+
+x<-c()
+
+efsname<-c()
+
+efets<-array(0,length(loc))
+
+cil<-c()
+
+cih<-c()
+
+type<-c()
+
+for(i in 1:length(loc)){
+
+    if(substr(loc[i],1,1)=="c"){
+        x[i]<-sub('^c', '', loc[i], perl = TRUE)
+        locs[i]<-sub('.loc', '@', x[i], perl = TRUE)
+    }else{
+        locs[i]<-as.character(loc[i])
+    }
+}
+
+ibm<-read.cross("csvs", ".", "IBM97_2236_genos.csv", "RILsLevelChr40qVar1qu97T_phes.csv",genotypes=c("A","H","B"), alleles=c("A","B"))
+ibm<-flip.order(ibm,c(2,4,7,10))
+ibmr<-convert2riself(ibm)
+ibmr <- sim.geno(ibmr, n.draws=16, error.prob=0.001)
+
+for(l in 1:length(locs)){
+
+    pos<-mean(c(dat[l,2], dat[l,3]))
+
+    cil<-c(cil,find.marker(ibmr, dat[l,6], dat[l,8]))
+
+    cih<-c(cih,find.marker(ibmr, dat[l,6], dat[l,9]))
+
+    mar1<-find.marker(ibmr, dat[l,6], dat[l,8])
+
+    pos1<-as.numeric(sub('^C\\d+\\D', '', mar1, perl = TRUE))
+
+    mar2<-find.marker(ibmr, dat[l,6], dat[l,9])
+
+    pos2<-as.numeric(sub('^C\\d+\\D', '', mar2, perl = TRUE))
+
+    if(dat[l,1]==dat[l,6]){
+
+        if(pos>=pos1&&pos<=pos2){
+            type<-c(type, "cis")
+        }
+
+        else{
+            type<-c(type, "trans")
+        }
+
+    }
+
+    else{
+        type<-c(type, "trans")
+    }
+
+}
+
+for(j in 1:length(locs)){
+    ef <- effectplot(ibmr,pheno.col=trt[j],  mname1=locs[j], draw=FALSE)
+    efs<-(ef$Means[2]-ef$Means[1])/2
+    efsname<-c(efsname, names(efs))
+    efets[j]<-efs[[1]]
+}
+
+cat(length(efsname), length(efets), sep="\t")
+
+df<-cbind(dat, effects=efets,cilow=cil, cihigh=cih,types=type)
+
+write.table(df, file="all_qtls_efets_flp_new_T19873.txt",sep="\t",row.names=F, quote=F)
+###
